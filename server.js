@@ -1,111 +1,75 @@
 import express from "express";
-import fs from "fs";
-import { v4 as uuidv4 } from "uuid"; // UUID generator
+import { v4 as uuidv4 } from "uuid";
+import dotenv from "dotenv";
+import pkg from "pg";
+
+dotenv.config(); // loads DATABASE_URL from .env
+const { Pool } = pkg;
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const DATA_FILE = "./data.json";
-const API_KEY = "chib"; // change this to your own key
+const API_KEY = "supersecret123";
+const ADMIN_KEY = "ultrasecret456";
 
-// Allow JSON body parsing
+// Create a Postgres connection pool (Neon requires SSL)
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
 app.use(express.json());
 
-// Ensure data file exists
-if (!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE, JSON.stringify([]));
-
-/* -------------------------------
-   ROUTES
---------------------------------*/
-
-// ✅ GET all items
-app.get("/items", (req, res) => {
-  const data = JSON.parse(fs.readFileSync(DATA_FILE, "utf-8"));
-  res.json(data);
+// --- GET all items ---
+app.get("/items", async (req, res) => {
+  const { rows } = await pool.query("SELECT * FROM items ORDER BY createdAt DESC");
+  res.json(rows);
 });
 
-// ✅ GET a single item by ID
-app.get("/items/:id", (req, res) => {
-  const { id } = req.params;
-  const data = JSON.parse(fs.readFileSync(DATA_FILE, "utf-8"));
-  const item = data.find(i => i.id === id);
-  if (!item) return res.status(404).json({ error: "Item not found" });
-  res.json(item);
-});
-
-// ✅ POST new item (protected + strict validation)
-app.post("/items", (req, res) => {
+// --- POST new item ---
+app.post("/items", async (req, res) => {
   const key = req.headers["x-api-key"];
-  if (key !== API_KEY) {
-    return res.status(401).json({ error: "Unauthorized — invalid or missing API key" });
+  if (key !== API_KEY) return res.status(401).json({ error: "Unauthorized" });
+
+  const { name, email } = req.body;
+  if (!name || !email) {
+    return res.status(400).json({ error: "Missing required fields: name and email" });
   }
 
-  // Strict validation — only 'name' and 'email' allowed
-  const allowedKeys = ["name", "email"];
-  const bodyKeys = Object.keys(req.body);
+  const id = uuidv4().split("-")[0];
+  const createdAt = new Date().toISOString();
 
-  // Missing required fields
-  if (!req.body.name || !req.body.email) {
-    return res
-      .status(400)
-      .json({ error: "Missing required fields: 'name' and 'email' are mandatory." });
-  }
+  await pool.query(
+    "INSERT INTO items (id, name, email, createdAt) VALUES ($1, $2, $3, $4)",
+    [id, name, email, createdAt]
+  );
 
-  // Extra unexpected fields
-  const hasExtraFields = bodyKeys.some(key => !allowedKeys.includes(key));
-  if (hasExtraFields) {
-    return res.status(400).json({ error: "Only 'name' and 'email' are allowed fields." });
-  }
-
-  const data = JSON.parse(fs.readFileSync(DATA_FILE, "utf-8"));
-
-  const newItem = {
-    // 🔹 Generate short 8-char ID (first UUID segment)
-    id: uuidv4().split("-")[0],
-    name: req.body.name,
-    email: req.body.email,
-    createdAt: new Date().toISOString(),
-  };
-
-  data.push(newItem);
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
-
-  res.json({ success: true, item: newItem });
+  const { rows } = await pool.query("SELECT * FROM items ORDER BY createdAt DESC");
+  res.json({ success: true, items: rows });
 });
 
-// ✅ DELETE item by ID (protected)
-app.delete("/items/:id", (req, res) => {
+// --- DELETE item by ID ---
+app.delete("/items/:id", async (req, res) => {
   const key = req.headers["x-api-key"];
-  if (key !== API_KEY) {
-    return res.status(401).json({ error: "Unauthorized — invalid or missing API key" });
-  }
+  if (key !== API_KEY) return res.status(401).json({ error: "Unauthorized" });
 
   const { id } = req.params;
-  const data = JSON.parse(fs.readFileSync(DATA_FILE, "utf-8"));
-  const newData = data.filter(item => item.id !== id);
+  const result = await pool.query("DELETE FROM items WHERE id = $1", [id]);
 
-  if (newData.length === data.length) {
+  if (result.rowCount === 0) {
     return res.status(404).json({ error: "Item not found" });
   }
 
-  fs.writeFileSync(DATA_FILE, JSON.stringify(newData, null, 2));
-  res.json({ success: true, message: `Item ${id} deleted`, items: newData });
+  const { rows } = await pool.query("SELECT * FROM items ORDER BY createdAt DESC");
+  res.json({ success: true, items: rows });
 });
 
-// ✅ NUKE endpoint — wipes all data (requires separate admin key)
-const ADMIN_KEY = "launch-codes"; // choose something strong and different from API_KEY
-
-app.delete("/nuke", (req, res) => {
+// --- NUKE (delete all items) ---
+app.delete("/nuke", async (req, res) => {
   const key = req.headers["x-admin-key"];
-  if (key !== ADMIN_KEY) {
-    return res.status(401).json({ error: "You aren't allowed to touch this!" });
-  }
+  if (key !== ADMIN_KEY) return res.status(401).json({ error: "Unauthorized" });
 
-  fs.writeFileSync(DATA_FILE, JSON.stringify([], null, 2));
-  res.json({ success: true, message: "💣 All items deleted. The database is now empty." });
+  await pool.query("DELETE FROM items");
+  res.json({ success: true, message: "💣 All items deleted." });
 });
 
-
-/* -------------------------------
-   SERVER START
---------------------------------*/
 app.listen(PORT, () => console.log(`✅ API running on http://localhost:${PORT}`));
